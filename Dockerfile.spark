@@ -1,0 +1,4 @@
+FROM apache/spark:3.5.1
+USER root
+RUN pip install --no-cache-dir pandas numpy scikit-learn redis pyarrow
+USER spark

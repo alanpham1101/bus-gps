@@ -23,7 +23,9 @@ def main():
         StructField("x", DoubleType(), True),
         StructField("y", DoubleType(), True),
         StructField("ignition", BooleanType(), True),
-        StructField("working", BooleanType(), True)
+        StructField("working", BooleanType(), True),
+        StructField("door_up", BooleanType(), True),
+        StructField("door_down", BooleanType(), True)
     ])
     
     root_schema = StructType([
