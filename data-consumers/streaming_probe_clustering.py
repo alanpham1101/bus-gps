@@ -89,7 +89,7 @@ HDFS_OUTPUT_PATH: str        = os.environ.get(
 )
 BUS_STOPS_PATH: str      = os.environ.get("BUS_STOPS_PATH", "/app/data/bus_stops.csv")
 CHECKPOINT_LOCATION: str = os.environ.get(
-    "CHECKPOINT_LOCATION", "/tmp/checkpoints/probe_clustering"
+    "CHECKPOINT_LOCATION", "hdfs://namenode:9000/checkpoints/probe_clustering_v2"
 )
 
 # Spatial
@@ -127,6 +127,8 @@ MSG_SCHEMA = StructType([
     StructField("y",        DoubleType(),  True),   # latitude
     StructField("ignition", BooleanType(), True),
     StructField("working",  BooleanType(), True),
+    StructField("door_up",  BooleanType(), True),
+    StructField("door_down", BooleanType(), True),
 ])
 
 # State schema: 5 JSON-encoded lists (x, y, speed, timestamp, grid_id)
@@ -170,14 +172,14 @@ def _build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
     · norm_ts  — timestamp chuẩn hóa [0,1] trong window → phân biệt điểm
                   ở cùng vị trí nhưng khác thời điểm
     """
-    ts_arr   = df["datetime"].values.astype(float)
-    ts_range = max(ts_arr.max() - ts_arr.min(), 1.0)
+    ts_arr = df["datetime"].values.astype(float)
+    TIME_WINDOW_SEC = 300.0  # 5 phút
+    t_scaled = ((ts_arr - ts_arr.min()) / TIME_WINDOW_SEC) * DBSCAN_EPS
 
     return np.column_stack([
         df["x"].values,
         df["y"].values,
-        1.0 / (df["speed"].values + 0.1),
-        (ts_arr - ts_arr.min()) / ts_range,
+        t_scaled
     ])
 
 
@@ -344,109 +346,110 @@ def accumulate_and_cluster(
 # 6.  SINK IMPLEMENTATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _redis_sink(congested_pdf: pd.DataFrame, batch_id: int) -> None:
-    """
-    Ghi cluster metadata vào Redis với 3 cấu trúc:
-      · GEOADD congestion:clusters      → geo-query theo khoảng cách
-      · HSET   congestion:cluster:<gid> → metadata chi tiết (TTL 10 phút)
-      · ZADD   congestion:severity      → sorted set top-200 vùng kẹt nặng nhất
-    """
-    if congested_pdf.empty:
+def _write_partition_to_redis(partition, batch_id: int, redis_host: str, redis_port: int, ttl: int, max_severity_keys: int) -> None:
+    """Writes a partition of aggregated congestion data directly from worker to Redis."""
+    import redis
+    from datetime import datetime, timezone
+    
+    rows = list(partition)
+    if not rows:
         return
-
+        
     try:
-        r    = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         pipe = r.pipeline(transaction=False)
 
-        for gid, grp in congested_pdf.groupby("grid_id"):
-            sgid = str(int(gid))
-            cx   = float(grp["x"].mean())
-            cy   = float(grp["y"].mean())
-            sev  = float(grp["severity"].max())
+        for row in rows:
+            sgid = str(int(row.grid_id))
+            cx   = float(row.cx)
+            cy   = float(row.cy)
+            sev  = float(row.severity)
 
             pipe.geoadd("congestion:clusters", [cx, cy, sgid])
             pipe.hset(f"congestion:cluster:{sgid}", mapping={
                 "status":       "Congested",
-                "avg_speed":    f"{grp['speed'].mean():.2f}",
-                "avg_tti":      f"{grp['tti'].mean():.2f}",
+                "avg_speed":    f"{row.avg_speed:.2f}",
+                "avg_tti":      f"{row.avg_tti:.2f}",
                 "severity":     f"{sev:.2f}",
-                "point_count":  str(len(grp)),
-                "vehicles":     str(grp["vehicle"].nunique()),
+                "point_count":  str(row.point_count),
+                "vehicles":     str(row.vehicles),
                 "centroid_lon": f"{cx:.6f}",
                 "centroid_lat": f"{cy:.6f}",
                 "updated_at":   datetime.now(timezone.utc).isoformat(),
                 "batch_id":     str(batch_id),
             })
-            pipe.expire(f"congestion:cluster:{sgid}", REDIS_TTL_SECONDS)
+            pipe.expire(f"congestion:cluster:{sgid}", ttl)
             pipe.zadd("congestion:severity", {sgid: sev})
-            pipe.zremrangebyrank("congestion:severity", 0, -(REDIS_MAX_SEVERITY_KEYS + 1))
+            pipe.zremrangebyrank("congestion:severity", 0, -(max_severity_keys + 1))
 
         pipe.execute()
-        logger.info(
-            "Batch %d | Redis: %d congested grid cells written.",
-            batch_id, congested_pdf["grid_id"].nunique(),
-        )
     except Exception as exc:
-        logger.error("Batch %d | Redis write failed: %s", batch_id, exc)
-
-
-_HDFS_SCHEMA = StructType([
-    StructField("vehicle",           StringType(),  True),
-    StructField("x",                 DoubleType(),  True),
-    StructField("y",                 DoubleType(),  True),
-    StructField("speed",             DoubleType(),  True),
-    StructField("event_ts",          LongType(),    True),
-    StructField("grid_id",           LongType(),    True),
-    StructField("cluster_id",        IntegerType(), True),
-    StructField("congestion_status", StringType(),  True),
-    StructField("tti",               DoubleType(),  True),
-    StructField("severity",          DoubleType(),  True),
-    StructField("buffer_size",       IntegerType(), True),
-    StructField("batch_id",          IntegerType(), True),
-    StructField("processed_at",      TimestampType(), True),
-])
-
-
-def _hdfs_sink(spark: SparkSession, pdf: pd.DataFrame, batch_id: int) -> None:
-    """
-    Append toàn bộ batch (Congested + Smooth) vào HDFS Parquet.
-    Partition by congestion_status → partition pruning cho downstream queries.
-    """
-    try:
-        out = pdf.copy()
-        out["batch_id"]    = batch_id
-        out["processed_at"] = pd.Timestamp.utcnow()
-
-        (
-            spark.createDataFrame(out, schema=_HDFS_SCHEMA)
-            .write.mode("append")
-            .partitionBy("congestion_status")
-            .parquet(HDFS_OUTPUT_PATH)
-        )
-        logger.info("Batch %d | HDFS: %d rows written to %s", batch_id, len(out), HDFS_OUTPUT_PATH)
-    except Exception as exc:
-        logger.error("Batch %d | HDFS write failed: %s", batch_id, exc)
+        print(f"Worker Redis write failed: {exc}") # Print to worker stdout/logs
 
 
 def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
-    """foreachBatch handler — Redis + HDFS."""
+    """foreachBatch handler — Redis + HDFS (Distributed)."""
     if batch_df.rdd.isEmpty():
         logger.info("Batch %d: empty — skipping.", batch_id)
         return
 
-    pdf       = batch_df.toPandas()
-    congested = pdf[pdf["congestion_status"] == "Congested"]
+    # Cache to avoid recomputation if actions are triggered multiple times
+    batch_df.cache()
+    
+    total_points = batch_df.count()
 
+    # 1. HDFS Sink (Distributed)
+    hdfs_df = batch_df.withColumn("batch_id", F.lit(batch_id)) \
+                      .withColumn("processed_at", F.current_timestamp())
+
+    try:
+        hdfs_df.write.mode("append") \
+               .partitionBy("congestion_status") \
+               .parquet(HDFS_OUTPUT_PATH)
+        logger.info("Batch %d | HDFS: %d rows written to %s", batch_id, total_points, HDFS_OUTPUT_PATH)
+    except Exception as exc:
+        logger.error("Batch %d | HDFS write failed: %s", batch_id, exc)
+
+    # 2. Redis Sink (Distributed)
+    congested_df = batch_df.filter(F.col("congestion_status") == "Congested")
+    
+    if congested_df.rdd.isEmpty():
+        logger.info("Batch %d | %d total points | 0 congested", batch_id, total_points)
+        batch_df.unpersist()
+        return
+
+    # Pre-aggregate directly on Spark (Distributed)
+    agg_df = congested_df.groupBy("grid_id").agg(
+        F.mean("x").alias("cx"),
+        F.mean("y").alias("cy"),
+        F.mean("speed").alias("avg_speed"),
+        F.mean("tti").alias("avg_tti"),
+        F.max("severity").alias("severity"),
+        F.count("*").alias("point_count"),
+        F.countDistinct("vehicle").alias("vehicles")
+    )
+    
+    congested_cells_count = agg_df.count()
     logger.info(
-        "Batch %d | %d total points | %d congested (%d grid cells)",
+        "Batch %d | %d total points | %d congested grid cells",
         batch_id,
-        len(pdf),
-        len(congested),
-        congested["grid_id"].nunique() if not congested.empty else 0,
+        total_points,
+        congested_cells_count,
     )
 
-    _redis_sink(congested, batch_id)
-    _hdfs_sink(batch_df.sparkSession, pdf, batch_id)
+    # Use foreachPartition to write to Redis from worker nodes
+    agg_df.foreachPartition(
+        lambda partition: _write_partition_to_redis(
+            partition, 
+            batch_id, 
+            REDIS_HOST, 
+            REDIS_PORT, 
+            REDIS_TTL_SECONDS, 
+            REDIS_MAX_SEVERITY_KEYS
+        )
+    )
+    
+    batch_df.unpersist()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -475,15 +478,16 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     Step 1: Kafka → Parse → Filter → Dwell-Time Filter.
     Trả về DataFrame streaming đã lọc sạch.
     """
-    # 1a. Broadcast bus stops (tiny table → avoid shuffle join)
-    bus_stops = (
-        spark.read
-        .option("header", "true").option("inferSchema", "true")
-        .csv(BUS_STOPS_PATH)
-        .withColumnRenamed("stop_x", "bs_x")
-        .withColumnRenamed("stop_y", "bs_y")
-        .select("bs_x", "bs_y")
-    )
+    # 1a. Đọc danh sách trạm xe buýt và tạo SQL Expression để tránh Streaming Aggregation
+    # (Đã comment lại theo yêu cầu, hiện tại chỉ dùng door_up/door_down)
+    # bus_stops = spark.read.option("header", "true").option("inferSchema", "true").csv(BUS_STOPS_PATH)
+    # stops = bus_stops.collect()
+    # 
+    # distance_conds = []
+    # for row in stops:
+    #     distance_conds.append(f"(sqrt(pow((y - {row.stop_y}) * {LAT_M}, 2) + pow((x - {row.stop_x}) * {LAT_M * COS_LAT}, 2)) < {DWELL_RADIUS_M})")
+    # 
+    # distance_expr = " OR ".join(distance_conds) if distance_conds else "false"
 
     # 1b. Kafka source
     raw = (
@@ -503,7 +507,7 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
             "d.vehicle",
             F.coalesce(F.col("d.speed"), F.lit(0.0)).alias("speed"),
             F.col("d.datetime"),
-            "d.x", "d.y", "d.ignition", "d.working",
+            "d.x", "d.y", "d.ignition", "d.working", "d.door_up", "d.door_down"
         )
         .filter(
             F.col("vehicle").isNotNull()
@@ -511,36 +515,22 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
             & F.col("y").isNotNull()
             & F.col("datetime").isNotNull()
         )
-        # Business filter: chỉ xe đang lưu thông
-        .filter(F.col("working") & F.col("ignition"))
+        # Business filter: chỉ xe đang lưu thông (coalesce to True if missing)
+        .filter(F.coalesce(F.col("working"), F.lit(True)) & F.coalesce(F.col("ignition"), F.lit(True)))
+        # Business filter: loại bỏ dữ liệu khi xe đang mở cửa đón/trả khách (coalesce to False if missing)
+        .filter(~(F.coalesce(F.col("door_up"), F.lit(False)) | F.coalesce(F.col("door_down"), F.lit(False))))
         # Thêm event_time dạng Timestamp (cần cho withWatermark)
         .withColumn("event_time", F.to_timestamp(F.col("datetime")))
     )
 
-    # 1d. Dwell-time filter: loại "dừng đón khách" gần trạm
-    with_dist = (
-        parsed.join(F.broadcast(bus_stops), how="left")
-        .withColumn(
-            "dist_m",
-            F.sqrt(
-                F.pow((F.col("y") - F.col("bs_y")) * F.lit(LAT_M), 2)
-                + F.pow((F.col("x") - F.col("bs_x")) * F.lit(LAT_M * COS_LAT), 2)
-            ),
-        )
-        .withColumn(
-            "is_dwell",
-            (F.col("speed") < DWELL_SPEED_KMH) & (F.col("dist_m") < DWELL_RADIUS_M),
-        )
-    )
+    # 1d. Dwell-time filter: loại "dừng đón khách" gần trạm (dùng SQL Expr thay vì Join + GroupBy)
+    # (Đã comment lại theo yêu cầu, hiện tại bỏ qua logic filter theo trạm)
+    # clean_stream = parsed.withColumn(
+    #     "is_dwell", 
+    #     F.expr(f"(speed < {DWELL_SPEED_KMH}) AND ({distance_expr})")
+    # ).filter(~F.col("is_dwell")).drop("is_dwell")
 
-    # Max(is_dwell) per point across all stop candidates
-    dwell_agg = with_dist.groupBy(
-        "vehicle", "speed", "datetime", "event_time", "x", "y"
-    ).agg(
-        F.max(F.col("is_dwell").cast("integer")).cast("boolean").alias("is_dwell")
-    )
-
-    return dwell_agg.filter(~F.col("is_dwell")).drop("is_dwell")
+    return parsed
 
 
 def main() -> None:
