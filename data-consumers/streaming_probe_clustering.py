@@ -350,11 +350,11 @@ def _write_partition_to_redis(partition, batch_id: int, redis_host: str, redis_p
     """Writes a partition of aggregated congestion data directly from worker to Redis."""
     import redis
     from datetime import datetime, timezone
-    
+
     rows = list(partition)
     if not rows:
         return
-        
+
     try:
         r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         pipe = r.pipeline(transaction=False)
@@ -395,7 +395,7 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
 
     # Cache to avoid recomputation if actions are triggered multiple times
     batch_df.cache()
-    
+
     total_points = batch_df.count()
 
     # 1. HDFS Sink (Distributed)
@@ -412,7 +412,7 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
 
     # 2. Redis Sink (Distributed)
     congested_df = batch_df.filter(F.col("congestion_status") == "Congested")
-    
+
     if congested_df.rdd.isEmpty():
         logger.info("Batch %d | %d total points | 0 congested", batch_id, total_points)
         batch_df.unpersist()
@@ -428,7 +428,7 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
         F.count("*").alias("point_count"),
         F.countDistinct("vehicle").alias("vehicles")
     )
-    
+
     congested_cells_count = agg_df.count()
     logger.info(
         "Batch %d | %d total points | %d congested grid cells",
@@ -440,15 +440,15 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
     # Use foreachPartition to write to Redis from worker nodes
     agg_df.foreachPartition(
         lambda partition: _write_partition_to_redis(
-            partition, 
-            batch_id, 
-            REDIS_HOST, 
-            REDIS_PORT, 
-            REDIS_TTL_SECONDS, 
+            partition,
+            batch_id,
+            REDIS_HOST,
+            REDIS_PORT,
+            REDIS_TTL_SECONDS,
             REDIS_MAX_SEVERITY_KEYS
         )
     )
-    
+
     batch_df.unpersist()
 
 
@@ -482,11 +482,11 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # (Đã comment lại theo yêu cầu, hiện tại chỉ dùng door_up/door_down)
     # bus_stops = spark.read.option("header", "true").option("inferSchema", "true").csv(BUS_STOPS_PATH)
     # stops = bus_stops.collect()
-    # 
+    #
     # distance_conds = []
     # for row in stops:
     #     distance_conds.append(f"(sqrt(pow((y - {row.stop_y}) * {LAT_M}, 2) + pow((x - {row.stop_x}) * {LAT_M * COS_LAT}, 2)) < {DWELL_RADIUS_M})")
-    # 
+    #
     # distance_expr = " OR ".join(distance_conds) if distance_conds else "false"
 
     # 1b. Kafka source
@@ -526,7 +526,7 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # 1d. Dwell-time filter: loại "dừng đón khách" gần trạm (dùng SQL Expr thay vì Join + GroupBy)
     # (Đã comment lại theo yêu cầu, hiện tại bỏ qua logic filter theo trạm)
     # clean_stream = parsed.withColumn(
-    #     "is_dwell", 
+    #     "is_dwell",
     #     F.expr(f"(speed < {DWELL_SPEED_KMH}) AND ({distance_expr})")
     # ).filter(~F.col("is_dwell")).drop("is_dwell")
 
