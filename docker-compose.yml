@@ -133,6 +133,20 @@ services:
     depends_on:
       - kafka
 
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    command: >
+      bash -c "
+        echo 'Đang chờ Kafka khởi động...' &&
+        cub kafka-ready -b kafka:9092 1 20 &&
+        echo 'Tạo topic hcmc_bus_gps...' &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:9092 --partitions 3 --replication-factor 1 --topic hcmc_bus_gps &&
+        echo 'Khởi tạo Kafka hoàn tất!'
+      "
+
   # ─────────────────────────────────────────────────────────────
   # Redis 7 — Serving Layer: GEOADD congestion map + HSET metadata
   # ─────────────────────────────────────────────────────────────
