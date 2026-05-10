@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 from dotenv import load_dotenv
+from typing import Optional
 import redis
 import json
 import asyncio
@@ -29,6 +30,8 @@ class GPSData(BaseModel):
     lng: float
     speed: float
     timestamp: str
+    route_id: Optional[str] = None
+    route_no: Optional[str] = None
 
 
 # ---------------------------
@@ -87,6 +90,41 @@ async def stream(request: Request):
             await asyncio.sleep(0.01)
 
     return EventSourceResponse(event_generator())
+
+
+# ---------------------------
+# Congestion snapshot
+# ---------------------------
+@app.get("/congestion_current")
+async def current_congestion():
+    """Return the latest congestion clusters, ordered by severity (highest first)."""
+    pairs = r.zrevrange("congestion:severity", 0, -1, withscores=True)
+    if not pairs:
+        return []
+
+    pipe = r.pipeline()
+    for gid, _sev in pairs:
+        pipe.hgetall(f"congestion:cluster:{gid}")
+    rows = pipe.execute()
+
+    result = []
+    for (gid, _sev), row in zip(pairs, rows):
+        if not row:
+            continue
+        result.append({
+            "grid_id":      gid,
+            "status":       row.get("status", "Congested"),
+            "avg_speed":    float(row.get("avg_speed", 0) or 0),
+            "avg_tti":      float(row.get("avg_tti", 0) or 0),
+            "severity":     float(row.get("severity", 0) or 0),
+            "point_count":  int(row.get("point_count", 0) or 0),
+            "vehicles":     int(row.get("vehicles", 0) or 0),
+            "centroid_lat": float(row.get("centroid_lat", 0) or 0),
+            "centroid_lon": float(row.get("centroid_lon", 0) or 0),
+            "updated_at":   row.get("updated_at", ""),
+            "batch_id":     row.get("batch_id", ""),
+        })
+    return result
 
 
 # ---------------------------

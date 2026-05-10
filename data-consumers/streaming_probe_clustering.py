@@ -113,6 +113,9 @@ STATE_TIMEOUT_MS       = 30 * 60_000  # 30 phút không có data → evict state
 FREE_FLOW_SPEED_KMH: float = 40.0
 REDIS_TTL_SECONDS          = 600   # cluster metadata tự expire sau 10 phút
 REDIS_MAX_SEVERITY_KEYS    = 200   # giữ top-200 điểm kẹt nặng nhất
+CONGESTION_UPDATES_CHANNEL: str = os.environ.get(
+    "CONGESTION_UPDATES_CHANNEL", "congestion_detection_updates"
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  SCHEMA DEFINITIONS
@@ -346,8 +349,17 @@ def accumulate_and_cluster(
 # 6.  SINK IMPLEMENTATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _write_partition_to_redis(partition, batch_id: int, redis_host: str, redis_port: int, ttl: int, max_severity_keys: int) -> None:
+def _write_partition_to_redis(
+    partition,
+    batch_id: int,
+    redis_host: str,
+    redis_port: int,
+    ttl: int,
+    max_severity_keys: int,
+    updates_channel: str,
+) -> None:
     """Writes a partition of aggregated congestion data directly from worker to Redis."""
+    import json
     import redis
     from datetime import datetime, timezone
 
@@ -364,6 +376,7 @@ def _write_partition_to_redis(partition, batch_id: int, redis_host: str, redis_p
             cx   = float(row.cx)
             cy   = float(row.cy)
             sev  = float(row.severity)
+            updated_at = datetime.now(timezone.utc).isoformat()
 
             pipe.geoadd("congestion:clusters", [cx, cy, sgid])
             pipe.hset(f"congestion:cluster:{sgid}", mapping={
@@ -375,12 +388,28 @@ def _write_partition_to_redis(partition, batch_id: int, redis_host: str, redis_p
                 "vehicles":     str(row.vehicles),
                 "centroid_lon": f"{cx:.6f}",
                 "centroid_lat": f"{cy:.6f}",
-                "updated_at":   datetime.now(timezone.utc).isoformat(),
+                "updated_at":   updated_at,
                 "batch_id":     str(batch_id),
             })
             pipe.expire(f"congestion:cluster:{sgid}", ttl)
             pipe.zadd("congestion:severity", {sgid: sev})
             pipe.zremrangebyrank("congestion:severity", 0, -(max_severity_keys + 1))
+
+            # Publish a clean JSON payload for SSE consumers (e.g. FastAPI /congestion_detection_stream)
+            payload = {
+                "grid_id":      sgid,
+                "status":       "Congested",
+                "avg_speed":    round(float(row.avg_speed), 2),
+                "avg_tti":      round(float(row.avg_tti), 2),
+                "severity":     round(sev, 2),
+                "point_count":  int(row.point_count),
+                "vehicles":     int(row.vehicles),
+                "centroid_lon": cx,
+                "centroid_lat": cy,
+                "updated_at":   updated_at,
+                "batch_id":     int(batch_id),
+            }
+            pipe.publish(updates_channel, json.dumps(payload, separators=(",", ":")))
 
         pipe.execute()
     except Exception as exc:
@@ -445,7 +474,8 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
             REDIS_HOST,
             REDIS_PORT,
             REDIS_TTL_SECONDS,
-            REDIS_MAX_SEVERITY_KEYS
+            REDIS_MAX_SEVERITY_KEYS,
+            CONGESTION_UPDATES_CHANNEL,
         )
     )
 
