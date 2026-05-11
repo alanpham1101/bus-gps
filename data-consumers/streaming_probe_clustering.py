@@ -33,7 +33,6 @@ Environment Variables
   REDIS_HOST               redis
   REDIS_PORT               6379
   HDFS_OUTPUT_PATH         hdfs://namenode:9000/data/analytics/congestion_behavior
-  BUS_STOPS_PATH           /app/data/bus_stops.csv
   CHECKPOINT_LOCATION      /tmp/checkpoints/probe_clustering
 """
 
@@ -307,31 +306,79 @@ def accumulate_and_cluster(
     )
     n_new = len(new_rows)
 
-    # ③ Append & trim
-    buf = _append_and_trim(buf, new_rows)
-
-    # ④ Build full buffer DataFrame & run DBSCAN
-    full_buf = pd.DataFrame({
-        "x":        buf["x"],
-        "y":        buf["y"],
-        "speed":    buf["spd"],
-        "datetime": buf["ts"],
-        "grid_id":  buf["gid"],
+    # ③ Ghép dữ liệu và chống nhiễu
+    new_rows["is_new"] = True
+    
+    old_df = pd.DataFrame({
+        "x": buf["x"], "y": buf["y"], "speed": buf["spd"],
+        "datetime": buf["ts"], "grid_id": buf["gid"]
     })
-    all_labels = _run_dbscan(full_buf)
+    old_df["is_new"] = False
+    
+    # Trộn lại, Xóa dữ liệu trùng lặp và Sắp xếp đúng trục thời gian
+    full_buf = pd.concat([old_df, new_rows], ignore_index=True)
+    full_buf = full_buf.drop_duplicates(subset=["datetime"], keep="last")
+    full_buf = full_buf.sort_values("datetime").reset_index(drop=True)
 
-    # ⑤ Emit new points only (tail of buffer)
-    emit = full_buf.tail(n_new).copy().reset_index(drop=True)
-    emit["cluster_id"] = all_labels[-n_new:]
+    # Chỉ chạy DBSCAN khi ĐÃ ĐỦ một batch size (TRAJECTORY_BUFFER_SIZE)
+    if len(full_buf) >= TRAJECTORY_BUFFER_SIZE:
+        all_labels = _run_dbscan(full_buf)
+    else:
+        import numpy as np
+        all_labels = np.full(len(full_buf), -1)
+
+    full_buf["cluster_id"] = all_labels
+
+    # Emit chỉ các điểm mới bằng cách lọc cờ `is_new`
+    emit = full_buf[full_buf["is_new"]].copy().reset_index(drop=True)
     emit["vehicle"]    = vehicle_id
 
-    # Derived fields
-    emit["congestion_status"] = np.where(emit["cluster_id"] >= 0, "Congested", "Smooth")
+    # Nếu chưa đủ buffer size, gán trạng thái là "Warming Up"
+    import numpy as np
+    emit["congestion_status"] = np.where(
+        emit["cluster_id"] >= 0, "Congested",
+        np.where(len(full_buf) < TRAJECTORY_BUFFER_SIZE, "Warming Up", "Smooth")
+    )
+
+    # --- HẬU XỬ LÝ (POST-PROCESSING) CHO TRẠNG THÁI DWELLING ---
+    # Phân tích toàn bộ buffer để có context chính xác nhất về cụm
+    valid_clusters = full_buf[full_buf["cluster_id"] >= 0]
+    if not valid_clusters.empty:
+        # Nhóm theo cụm để tính các đặc trưng
+        cluster_stats = valid_clusters.groupby("cluster_id").agg({
+            "speed": "max",
+            "x": ["max", "min"],
+            "y": ["max", "min"]
+        })
+        
+        # Hằng số xấp xỉ chuyển đổi tọa độ sang mét (HCMC)
+        LAT_M_C = 111320.0
+        COS_LAT_C = 0.982287  # cos(10.8 deg)
+        
+        dwelling_cids = []
+        for cid, row in cluster_stats.iterrows():
+            max_spd = row[("speed", "max")]
+            dx_m = (row[("x", "max")] - row[("x", "min")]) * LAT_M_C * COS_LAT_C
+            dy_m = (row[("y", "max")] - row[("y", "min")]) * LAT_M_C
+            dist_m = np.sqrt(dx_m**2 + dy_m**2)
+            
+            # Heuristic: Vận tốc tối đa trong 5 phút < 3.0 km/h và xe nhích < 15 mét
+            if max_spd < 3.0 and dist_m < 15.0:
+                dwelling_cids.append(cid)
+                
+        # Cập nhật lại nhãn cho emit nếu điểm thuộc cụm Dwelling
+        if dwelling_cids:
+            emit["congestion_status"] = np.where(
+                emit["cluster_id"].isin(dwelling_cids), 
+                "Dwelling", 
+                emit["congestion_status"]
+            )
+    # --- END HẬU XỬ LÝ ---
+
     emit["tti"]      = (FREE_FLOW_SPEED_KMH / emit["speed"].clip(lower=1.0)).round(3)
     emit["severity"] = _compute_severity(emit["cluster_id"], emit["tti"])
-    emit["buffer_size"] = len(buf["x"])
+    emit["buffer_size"] = len(full_buf)
 
-    # Rename datetime → event_ts to avoid conflict with Python built-in
     emit = emit.rename(columns={"datetime": "event_ts"})
 
     output_cols = [
@@ -339,8 +386,16 @@ def accumulate_and_cluster(
         "cluster_id", "congestion_status", "tti", "severity", "buffer_size",
     ]
 
-    # ⑥ Save state
-    _save_state(state, buf)
+    # Trim: Chỉ lưu TRAJECTORY_BUFFER_SIZE điểm thời gian MỚI NHẤT
+    trim_buf = full_buf.tail(TRAJECTORY_BUFFER_SIZE)
+    new_buf = {
+        "x": trim_buf["x"].tolist(),
+        "y": trim_buf["y"].tolist(),
+        "spd": trim_buf["speed"].tolist(),
+        "ts": trim_buf["datetime"].tolist(),
+        "gid": trim_buf["grid_id"].tolist()
+    }
+    _save_state(state, new_buf)
 
     yield emit[output_cols]
 
@@ -350,66 +405,75 @@ def accumulate_and_cluster(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _write_partition_to_redis(
-    partition,
+    partition, 
     batch_id: int,
-    redis_host: str,
-    redis_port: int,
-    ttl: int,
+    redis_host: str, 
+    redis_port: int, 
+    ttl: int, 
     max_severity_keys: int,
-    updates_channel: str,
-) -> None:
+    updates_channel: str) -> None:
     """Writes a partition of aggregated congestion data directly from worker to Redis."""
-    import json
     import redis
     from datetime import datetime, timezone
-
+    
     rows = list(partition)
     if not rows:
         return
-
+        
     try:
         r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         pipe = r.pipeline(transaction=False)
 
         for row in rows:
             sgid = str(int(row.grid_id))
-            cx   = float(row.cx)
-            cy   = float(row.cy)
-            sev  = float(row.severity)
-            updated_at = datetime.now(timezone.utc).isoformat()
+            
+            # Active Invalidation Pattern: Kiểm tra xem lưới này còn xe kẹt hay không
+            if row.congested_count > 0:
+                # Vẫn còn tắc nghẽn -> Cập nhật/Thêm mới trên Redis
+                cx   = float(row.cx)
+                cy   = float(row.cy)
+                sev  = float(row.severity)
+                updated_at = datetime.now(timezone.utc).isoformat()
 
-            pipe.geoadd("congestion:clusters", [cx, cy, sgid])
-            pipe.hset(f"congestion:cluster:{sgid}", mapping={
-                "status":       "Congested",
-                "avg_speed":    f"{row.avg_speed:.2f}",
-                "avg_tti":      f"{row.avg_tti:.2f}",
-                "severity":     f"{sev:.2f}",
-                "point_count":  str(row.point_count),
-                "vehicles":     str(row.vehicles),
-                "centroid_lon": f"{cx:.6f}",
-                "centroid_lat": f"{cy:.6f}",
-                "updated_at":   updated_at,
-                "batch_id":     str(batch_id),
-            })
-            pipe.expire(f"congestion:cluster:{sgid}", ttl)
-            pipe.zadd("congestion:severity", {sgid: sev})
-            pipe.zremrangebyrank("congestion:severity", 0, -(max_severity_keys + 1))
+                pipe.geoadd("congestion:clusters", [cx, cy, sgid])
+                pipe.hset(f"congestion:cluster:{sgid}", mapping={
+                    "status":       "Congested",
+                    "avg_speed":    f"{row.avg_speed:.2f}",
+                    "avg_tti":      f"{row.avg_tti:.2f}",
+                    "severity":     f"{sev:.2f}",
+                    "point_count":  str(row.point_count),
+                    "vehicles":     str(row.vehicles),
+                    "centroid_lon": f"{cx:.6f}",
+                    "centroid_lat": f"{cy:.6f}",
+                    "updated_at":   datetime.now(timezone.utc).isoformat(),
+                    "batch_id":     str(batch_id),
+                })
+                pipe.expire(f"congestion:cluster:{sgid}", ttl)
+                pipe.zadd("congestion:severity", {sgid: sev})
+            else:
+                # Đã hết tắc nghẽn (Mọi xe đều Smooth) -> Xóa ngay lập tức khỏi Redis
+                pipe.zrem("congestion:clusters", sgid)
+                pipe.delete(f"congestion:cluster:{sgid}")
+                pipe.zrem("congestion:severity", sgid)
+                
+        # Dọn dẹp rác định kỳ trên ZSET
+        pipe.zremrangebyrank("congestion:severity", 0, -(max_severity_keys + 1))
 
-            # Publish a clean JSON payload for SSE consumers (e.g. FastAPI /congestion_detection_stream)
-            payload = {
-                "grid_id":      sgid,
-                "status":       "Congested",
-                "avg_speed":    round(float(row.avg_speed), 2),
-                "avg_tti":      round(float(row.avg_tti), 2),
-                "severity":     round(sev, 2),
-                "point_count":  int(row.point_count),
-                "vehicles":     int(row.vehicles),
-                "centroid_lon": cx,
-                "centroid_lat": cy,
-                "updated_at":   updated_at,
-                "batch_id":     int(batch_id),
-            }
-            pipe.publish(updates_channel, json.dumps(payload, separators=(",", ":")))
+        # Publish a clean JSON payload for SSE consumers (e.g. FastAPI /congestion_detection_stream)
+        payload = {
+            "grid_id":      sgid,
+            "status":       "Congested",
+            "avg_speed":    round(float(row.avg_speed), 2),
+            "avg_tti":      round(float(row.avg_tti), 2),
+            "severity":     round(sev, 2),
+            "point_count":  int(row.point_count),
+            "vehicles":     int(row.vehicles),
+            "centroid_lon": cx,
+            "centroid_lat": cy,
+            "updated_at":   updated_at,
+            "batch_id":     int(batch_id),
+        }
+        pipe.publish(updates_channel, json.dumps(payload, separators=(",", ":")))
 
         pipe.execute()
     except Exception as exc:
@@ -424,41 +488,39 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
 
     # Cache to avoid recomputation if actions are triggered multiple times
     batch_df.cache()
-
+    
     total_points = batch_df.count()
 
     # 1. HDFS Sink (Distributed)
-    hdfs_df = batch_df.withColumn("batch_id", F.lit(batch_id)) \
+    # Loại bỏ dữ liệu đỗ chờ (Dwelling) khỏi lưu trữ HDFS theo yêu cầu
+    hdfs_df = batch_df.filter(F.col("congestion_status") != "Dwelling") \
+                      .withColumn("batch_id", F.lit(batch_id)) \
                       .withColumn("processed_at", F.current_timestamp())
 
     try:
+        # Re-compute hdfs count for accurate logging after filter
+        hdfs_count = hdfs_df.count()
         hdfs_df.write.mode("append") \
                .partitionBy("congestion_status") \
                .parquet(HDFS_OUTPUT_PATH)
-        logger.info("Batch %d | HDFS: %d rows written to %s", batch_id, total_points, HDFS_OUTPUT_PATH)
+        logger.info("Batch %d | HDFS: %d rows written to %s", batch_id, hdfs_count, HDFS_OUTPUT_PATH)
     except Exception as exc:
         logger.error("Batch %d | HDFS write failed: %s", batch_id, exc)
 
-    # 2. Redis Sink (Distributed)
-    congested_df = batch_df.filter(F.col("congestion_status") == "Congested")
-
-    if congested_df.rdd.isEmpty():
-        logger.info("Batch %d | %d total points | 0 congested", batch_id, total_points)
-        batch_df.unpersist()
-        return
-
-    # Pre-aggregate directly on Spark (Distributed)
-    agg_df = congested_df.groupBy("grid_id").agg(
+    # Redis Sink (Distributed) - Active Invalidation Pattern
+    # Gom toàn bộ dữ liệu (cả Smooth và Congested) để quyết định trạng thái của lưới
+    agg_df = batch_df.groupBy("grid_id").agg(
+        F.sum(F.when(F.col("congestion_status") == "Congested", 1).otherwise(0)).alias("congested_count"),
         F.mean("x").alias("cx"),
         F.mean("y").alias("cy"),
-        F.mean("speed").alias("avg_speed"),
-        F.mean("tti").alias("avg_tti"),
-        F.max("severity").alias("severity"),
+        F.mean(F.when(F.col("congestion_status") == "Congested", F.col("speed"))).alias("avg_speed"),
+        F.mean(F.when(F.col("congestion_status") == "Congested", F.col("tti"))).alias("avg_tti"),
+        F.max(F.when(F.col("congestion_status") == "Congested", F.col("severity"))).alias("severity"),
         F.count("*").alias("point_count"),
         F.countDistinct("vehicle").alias("vehicles")
     )
-
-    congested_cells_count = agg_df.count()
+    
+    congested_cells_count = agg_df.filter(F.col("congested_count") > 0).count()
     logger.info(
         "Batch %d | %d total points | %d congested grid cells",
         batch_id,
@@ -466,19 +528,19 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
         congested_cells_count,
     )
 
-    # Use foreachPartition to write to Redis from worker nodes
+    # Use foreachPartition to write/delete to Redis from worker nodes
     agg_df.foreachPartition(
         lambda partition: _write_partition_to_redis(
-            partition,
-            batch_id,
-            REDIS_HOST,
-            REDIS_PORT,
-            REDIS_TTL_SECONDS,
+            partition, 
+            batch_id, 
+            REDIS_HOST, 
+            REDIS_PORT, 
+            REDIS_TTL_SECONDS, 
             REDIS_MAX_SEVERITY_KEYS,
             CONGESTION_UPDATES_CHANNEL,
         )
     )
-
+    
     batch_df.unpersist()
 
 
@@ -512,11 +574,11 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # (Đã comment lại theo yêu cầu, hiện tại chỉ dùng door_up/door_down)
     # bus_stops = spark.read.option("header", "true").option("inferSchema", "true").csv(BUS_STOPS_PATH)
     # stops = bus_stops.collect()
-    #
+    # 
     # distance_conds = []
     # for row in stops:
     #     distance_conds.append(f"(sqrt(pow((y - {row.stop_y}) * {LAT_M}, 2) + pow((x - {row.stop_x}) * {LAT_M * COS_LAT}, 2)) < {DWELL_RADIUS_M})")
-    #
+    # 
     # distance_expr = " OR ".join(distance_conds) if distance_conds else "false"
 
     # 1b. Kafka source
@@ -556,7 +618,7 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # 1d. Dwell-time filter: loại "dừng đón khách" gần trạm (dùng SQL Expr thay vì Join + GroupBy)
     # (Đã comment lại theo yêu cầu, hiện tại bỏ qua logic filter theo trạm)
     # clean_stream = parsed.withColumn(
-    #     "is_dwell",
+    #     "is_dwell", 
     #     F.expr(f"(speed < {DWELL_SPEED_KMH}) AND ({distance_expr})")
     # ).filter(~F.col("is_dwell")).drop("is_dwell")
 
@@ -568,10 +630,10 @@ def main() -> None:
     spark.sparkContext.setLogLevel("WARN")
     logger.info("SparkSession started: %s", spark.sparkContext.appName)
 
-    # Step 1 — Ingestion & Filter
+    # Ingestion & Filter
     clean_stream = _build_ingestion_pipeline(spark)
 
-    # Step 2 — Grid Indexing
+    # Grid Indexing
     gridded = clean_stream.withColumn(
         "grid_id",
         (
@@ -580,11 +642,13 @@ def main() -> None:
         ).cast("long"),
     )
 
-    # Step 3+4 — Stateful DBSCAN per vehicle
-    # withWatermark trên event_time (TimestampType) — đúng kiểu dữ liệu
+    # Stateful DBSCAN per vehicle
+    # withWatermark trên event_time để chặn dữ liệu trễ quá 5 phút (Late Data / Old Messages)
+    # dropDuplicates để loại bỏ 2 dữ liệu trùng nhau trên cùng 1 xe (Duplicate Data)
     labeled = (
         gridded
         .withWatermark("event_time", "5 minutes")
+        .dropDuplicates(["vehicle", "event_time"])
         .groupBy("vehicle")
         .applyInPandasWithState(
             func=accumulate_and_cluster,
@@ -595,14 +659,13 @@ def main() -> None:
         )
     )
 
-    # Step 5 — Multi-Sink
+    # Multi-Sink
     query = (
         labeled
         .writeStream
         .outputMode("append")
         .option("checkpointLocation", CHECKPOINT_LOCATION)
         .foreachBatch(write_to_sinks)
-        .trigger(processingTime="30 seconds")
         .start()
     )
 

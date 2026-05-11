@@ -51,6 +51,23 @@ services:
       - spark-data:/opt/spark/work-dir
       - .:/app
 
+  spark-worker-3:
+    image: custom-spark:3.5.1
+    container_name: spark-worker-3
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1g
+      - SPARK_WORKER_CORES=1
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+    volumes:
+      - spark-data:/opt/spark/work-dir
+      - .:/app
+
   publisher:
     image: python:3.11-slim
     container_name: bus-publisher
