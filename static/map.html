@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bus Tracking</title>
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+</head>
+<body>
+
+<div id="map" style="height: 900px;"></div>
+
+<script>
+var map = L.map('map').setView([10.76, 106.66], 15);
+const BUS_COLORS = [
+    "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
+    "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe",
+    "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000",
+    "#aaffc3", "#808000", "#ffd8b1", "#000075", "#808080"
+];
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png')
+    .addTo(map);
+
+var markers = {};
+var congestionMarkers = {};
+var congestionTimers = {};
+const CONGESTION_RADIUS_M = 200;
+const CONGESTION_TTL_MS = 30000;
+
+fetch("/bus_current")
+.then(res => res.json())
+.then(data => {
+    data.forEach(bus => {
+        createOrUpdateBusMarker(bus);
+    });
+});
+
+fetch("/congestion_current")
+.then(res => res.json())
+.then(data => {
+    data.forEach(c => createOrUpdateCongestionMarker(c));
+});
+
+const busEventSource = new EventSource("http://localhost:8000/bus_stream");
+const congestionEventSource = new EventSource("http://localhost:8000/congestion_detection_stream");
+
+busEventSource.addEventListener("update", function(event) {
+    console.log("SSE bus received:", event.data);
+    const bus = JSON.parse(event.data);
+    createOrUpdateBusMarker(bus);
+});
+
+congestionEventSource.addEventListener("update", function(event) {
+    console.log("SSE congestion received:", event.data);
+    const congestion = JSON.parse(event.data);
+    createOrUpdateCongestionMarker(congestion);
+});
+
+function createOrUpdateBusMarker(bus) {
+    const latlng = [bus.lat, bus.lng];
+    const tooltipContent = `
+        <b>Route:</b> ${bus.route_no ? bus.route_no : "—"}<br>
+        <b>Bus:</b> ${bus.bus_id}<br>
+        <b>Speed:</b> ${bus.speed} km/h<br>
+        <b>Lat:</b> ${bus.lat.toFixed(5)}<br>
+        <b>Lng:</b> ${bus.lng.toFixed(5)}
+    `;
+
+    if (markers[bus.bus_id]) {
+        markers[bus.bus_id]
+            .setLatLng(latlng)
+            .setTooltipContent(tooltipContent);
+    } else {
+        markers[bus.bus_id] = L.circleMarker(latlng, {
+            radius: 5,
+            color: "black",
+            weight: 2,
+            fillColor: getBusColor(bus.bus_id),
+            fillOpacity: 0.8
+        })
+        .addTo(map)
+        .bindTooltip(tooltipContent, {
+            permanent: false,
+            direction: "top",
+            offset: [0, -5],
+            opacity: 0.9
+        });
+    }
+}
+
+function createOrUpdateCongestionMarker(c) {
+    const lat = parseFloat(c.centroid_lat);
+    const lng = parseFloat(c.centroid_lon);
+    if (!isFinite(lat) || !isFinite(lng)) return;
+
+    const key = c.grid_id || `${lat.toFixed(5)}_${lng.toFixed(5)}`;
+    const sev = parseFloat(c.severity) || 0;
+    const color = getCongestionColor(sev);
+    const tooltipContent = `
+        <b>Congestion</b><br>
+        <b>Severity:</b> ${sev.toFixed(2)}<br>
+        <b>Avg speed:</b> ${(parseFloat(c.avg_speed) || 0).toFixed(1)} km/h<br>
+        <b>Avg TTI:</b> ${(parseFloat(c.avg_tti) || 0).toFixed(2)}<br>
+        <b>Vehicles:</b> ${c.vehicles}<br>
+        <b>Points:</b> ${c.point_count}<br>
+        <b>Updated:</b> ${c.updated_at}
+    `;
+
+    if (congestionMarkers[key]) {
+        congestionMarkers[key]
+            .setLatLng([lat, lng])
+            .setStyle({ color: color, fillColor: color })
+            .setTooltipContent(tooltipContent);
+    } else {
+        congestionMarkers[key] = L.circle([lat, lng], {
+            radius: CONGESTION_RADIUS_M,
+            color: color,
+            fillColor: color,
+            fillOpacity: 0.18,
+            weight: 1
+        })
+        .addTo(map)
+        .bindTooltip(tooltipContent, {
+            permanent: false,
+            direction: "top",
+            opacity: 0.9
+        });
+    }
+
+    if (congestionTimers[key]) {
+        clearTimeout(congestionTimers[key]);
+    }
+    congestionTimers[key] = setTimeout(() => {
+        removeCongestionMarker(key);
+    }, CONGESTION_TTL_MS);
+}
+
+function removeCongestionMarker(key) {
+    const marker = congestionMarkers[key];
+    if (marker) {
+        map.removeLayer(marker);
+        delete congestionMarkers[key];
+    }
+    if (congestionTimers[key]) {
+        clearTimeout(congestionTimers[key]);
+        delete congestionTimers[key];
+    }
+}
+
+function getBusColor(bus_id) {
+    const hash = hashString(bus_id);
+    return BUS_COLORS[hash % BUS_COLORS.length];
+}
+
+function hashString(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return Math.abs(hash);
+}
+
+function getCongestionColor(severity) {
+    // Spark consumer computes severity in [0, 25] (density × tti, each clamped to [0, 5]).
+    if (severity >= 5) return "#d7191c";   // red    — heavy
+    if (severity >= 2) return "#fdae61";   // orange — moderate
+    return "#ffffbf";                      // yellow — mild
+}
+</script>
+
+</body>
+</html>

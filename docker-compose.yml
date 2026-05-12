@@ -25,8 +25,8 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=1g
+      - SPARK_WORKER_CORES=1
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077
@@ -42,8 +42,8 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=1g
+      - SPARK_WORKER_CORES=1
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077
@@ -59,14 +59,56 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=1g
+      - SPARK_WORKER_CORES=1
     command: >
       /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
       spark://spark-master:7077
     volumes:
       - spark-data:/opt/spark/work-dir
       - .:/app
+
+  publisher:
+    image: python:3.11-slim
+    container_name: bus-publisher
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=hcmc_bus_gps
+      - INPUT_FILE=/app/data-publisher/input_data/sample.json
+      - BATCH_SIZE=500
+      - BATCH_INTERVAL_SECONDS=30
+    volumes:
+      - .:/app
+    working_dir: /app
+    profiles:
+      - publish
+    command: >
+      sh -c "pip install --no-cache-dir ijson==3.3.0 kafka-python==2.0.2 lz4==4.3.3 &&
+             python data-publisher/publisher.py"
+
+  tracking-gps-data:
+    image: python:3.11-slim
+    container_name: gps-tracking-bridge
+    depends_on:
+      - kafka
+      - redis
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC=hcmc_bus_gps
+      - KAFKA_GROUP_ID=gps-data-tracking
+      - KAFKA_AUTO_OFFSET_RESET=latest
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - .:/app
+    working_dir: /app
+    profiles:
+      - tracking-gps
+    command: >
+      sh -c "pip install --no-cache-dir kafka-python==2.0.2 redis==7.4.0 lz4==4.3.3 &&
+             python data-consumers/tracking_gps_data.py"
 
   spark-submit:
     image: custom-spark:3.5.1

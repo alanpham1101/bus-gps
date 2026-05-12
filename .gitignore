@@ -1,4 +1,4 @@
 .venv
 *.zip
-data-extracted/
+input_data/
 __pycache__

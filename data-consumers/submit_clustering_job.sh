@@ -12,9 +12,12 @@ MSYS_NO_PATHCONV=1 docker compose --profile submit run --rm \
   spark-submit \
   /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
-  --total-executor-cores 4 \
+  --total-executor-cores 2 \
+  --executor-memory 512m \
+  --driver-memory 512m \
   --conf spark.jars.ivy=/tmp/.ivy2 \
   --conf spark.executorEnv.HADOOP_USER_NAME=root \
+  --conf spark.sql.shuffle.partitions=4 \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
   --conf spark.sql.execution.arrow.pyspark.enabled=true \
   /app/data-consumers/streaming_probe_clustering.py
