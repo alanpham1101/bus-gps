@@ -21,6 +21,7 @@ r = redis.Redis(
     decode_responses=True
 )
 
+
 # ---------------------------
 # GPS Data Model
 # ---------------------------
@@ -56,6 +57,7 @@ class CongestionDectionData(BaseModel):
 @app.get("/")
 async def root():
     return FileResponse("static/map.html")
+
 
 # ---------------------------
 # Bus snapshot
@@ -97,7 +99,9 @@ async def stream(request: Request):
 # ---------------------------
 @app.get("/congestion_current")
 async def current_congestion():
-    """Return the latest congestion clusters, ordered by severity (highest first)."""
+    """Return the latest congestion clusters
+       ordered by severity (highest first).
+    """
     pairs = r.zrevrange("congestion:severity", 0, -1, withscores=True)
     if not pairs:
         return []
@@ -128,7 +132,7 @@ async def current_congestion():
 
 
 # ---------------------------
-# SSE Congestion Dectection Streaming Endpoint
+# SSE Congestion Detection Streaming Endpoint
 # ---------------------------
 @app.get("/congestion_detection_stream")
 async def stream(request: Request):

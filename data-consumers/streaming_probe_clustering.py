@@ -42,12 +42,10 @@ import json
 import math
 import logging
 import os
-from datetime import datetime, timezone
 from typing import Iterator, Tuple
 
 import numpy as np
 import pandas as pd
-import redis
 from sklearn.cluster import DBSCAN
 
 from pyspark.sql import DataFrame, SparkSession
@@ -61,7 +59,6 @@ from pyspark.sql.types import (
     StringType,
     StructField,
     StructType,
-    TimestampType,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +117,7 @@ CONGESTION_UPDATES_CHANNEL: str = os.environ.get(
 # 2.  SCHEMA DEFINITIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Schema của Kafka message value (đã flatten bởi data-publisher)
+# Kafka message schema (flattened by data-publisher)
 MSG_SCHEMA = StructType([
     StructField("vehicle",  StringType(),  True),
     StructField("speed",    DoubleType(),  True),
@@ -134,7 +131,7 @@ MSG_SCHEMA = StructType([
 ])
 
 # State schema: 5 JSON-encoded lists (x, y, speed, timestamp, grid_id)
-# Dùng 5 StringType riêng biệt — đơn giản, an toàn với applyInPandasWithState
+# with applyInPandasWithState
 STATE_SCHEMA = StructType([
     StructField("x_json",   StringType(), False),
     StructField("y_json",   StringType(), False),
@@ -143,7 +140,7 @@ STATE_SCHEMA = StructType([
     StructField("gid_json", StringType(), False),
 ])
 
-# Output schema của applyInPandasWithState
+# Schema output of applyInPandasWithState
 OUTPUT_SCHEMA = StructType([
     StructField("vehicle",           StringType(),  False),
     StructField("x",                 DoubleType(),  False),
@@ -157,6 +154,7 @@ OUTPUT_SCHEMA = StructType([
     StructField("severity",          DoubleType(),  False),
     StructField("buffer_size",       IntegerType(), False),
 ])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  CORE CLUSTERING LOGIC
@@ -282,12 +280,12 @@ def accumulate_and_cluster(
     Stateful function nhóm theo vehicle_id.
 
     Quy trình mỗi micro-batch:
-      ① Đọc buffer lịch sử của xe từ state.
-      ② Gộp và sort các điểm mới theo thời gian.
-      ③ Append vào buffer, trim về TRAJECTORY_BUFFER_SIZE.
-      ④ Chạy DBSCAN trên toàn buffer (lịch sử + mới).
-      ⑤ Emit CHỈ các điểm mới với cluster label được gán.
-      ⑥ Lưu buffer mới vào state.
+      1. Đọc buffer lịch sử của xe từ state.
+      2. Gộp và sort các điểm mới theo thời gian.
+      3. Append vào buffer, trim về TRAJECTORY_BUFFER_SIZE.
+      4. Chạy DBSCAN trên toàn buffer (lịch sử + mới).
+      5. Emit chỉ các điểm mới với cluster label được gán.
+      6. Lưu buffer mới vào state.
 
     Tại sao chỉ emit điểm mới?
     → Điểm cũ đã emit ở batch trước → tránh duplicate trong sink.
@@ -295,26 +293,25 @@ def accumulate_and_cluster(
     """
     vehicle_id: str = key[0]
 
-    # ① Load state
+    # 1. Load state
     buf = _load_state(state)
 
-    # ② Collect & sort new points
+    # 2. Collect & sort new points
     new_rows = (
         pd.concat(list(pdf_iter), ignore_index=True)
         .sort_values("datetime")
         .reset_index(drop=True)
     )
-    n_new = len(new_rows)
 
-    # ③ Ghép dữ liệu và chống nhiễu
+    # 3. Ghép dữ liệu và chống nhiễu
     new_rows["is_new"] = True
-    
+
     old_df = pd.DataFrame({
         "x": buf["x"], "y": buf["y"], "speed": buf["spd"],
         "datetime": buf["ts"], "grid_id": buf["gid"]
     })
     old_df["is_new"] = False
-    
+
     # Trộn lại, Xóa dữ liệu trùng lặp và Sắp xếp đúng trục thời gian
     full_buf = pd.concat([old_df, new_rows], ignore_index=True)
     full_buf = full_buf.drop_duplicates(subset=["datetime"], keep="last")
@@ -350,27 +347,27 @@ def accumulate_and_cluster(
             "x": ["max", "min"],
             "y": ["max", "min"]
         })
-        
+
         # Hằng số xấp xỉ chuyển đổi tọa độ sang mét (HCMC)
         LAT_M_C = 111320.0
         COS_LAT_C = 0.982287  # cos(10.8 deg)
-        
+
         dwelling_cids = []
         for cid, row in cluster_stats.iterrows():
             max_spd = row[("speed", "max")]
             dx_m = (row[("x", "max")] - row[("x", "min")]) * LAT_M_C * COS_LAT_C
             dy_m = (row[("y", "max")] - row[("y", "min")]) * LAT_M_C
             dist_m = np.sqrt(dx_m**2 + dy_m**2)
-            
+
             # Heuristic: Vận tốc tối đa trong 5 phút < 3.0 km/h và xe nhích < 15 mét
             if max_spd < 3.0 and dist_m < 15.0:
                 dwelling_cids.append(cid)
-                
+
         # Cập nhật lại nhãn cho emit nếu điểm thuộc cụm Dwelling
         if dwelling_cids:
             emit["congestion_status"] = np.where(
-                emit["cluster_id"].isin(dwelling_cids), 
-                "Dwelling", 
+                emit["cluster_id"].isin(dwelling_cids),
+                "Dwelling",
                 emit["congestion_status"]
             )
     # --- END HẬU XỬ LÝ ---
@@ -405,28 +402,29 @@ def accumulate_and_cluster(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _write_partition_to_redis(
-    partition, 
+    partition,
     batch_id: int,
-    redis_host: str, 
-    redis_port: int, 
-    ttl: int, 
+    redis_host: str,
+    redis_port: int,
+    ttl: int,
     max_severity_keys: int,
-    updates_channel: str) -> None:
+    updates_channel: str
+) -> None:
     """Writes a partition of aggregated congestion data directly from worker to Redis."""
     import redis
     from datetime import datetime, timezone
-    
+
     rows = list(partition)
     if not rows:
         return
-        
+
     try:
         r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         pipe = r.pipeline(transaction=False)
 
         for row in rows:
             sgid = str(int(row.grid_id))
-            
+
             # Active Invalidation Pattern: Kiểm tra xem lưới này còn xe kẹt hay không
             if row.congested_count > 0:
                 # Vẫn còn tắc nghẽn -> Cập nhật/Thêm mới trên Redis
@@ -455,7 +453,7 @@ def _write_partition_to_redis(
                 pipe.zrem("congestion:clusters", sgid)
                 pipe.delete(f"congestion:cluster:{sgid}")
                 pipe.zrem("congestion:severity", sgid)
-                
+
         # Dọn dẹp rác định kỳ trên ZSET
         pipe.zremrangebyrank("congestion:severity", 0, -(max_severity_keys + 1))
 
@@ -477,7 +475,7 @@ def _write_partition_to_redis(
 
         pipe.execute()
     except Exception as exc:
-        print(f"Worker Redis write failed: {exc}") # Print to worker stdout/logs
+        print(f"Worker Redis write failed: {exc}")
 
 
 def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
@@ -488,7 +486,7 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
 
     # Cache to avoid recomputation if actions are triggered multiple times
     batch_df.cache()
-    
+
     total_points = batch_df.count()
 
     # 1. HDFS Sink (Distributed)
@@ -519,7 +517,7 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
         F.count("*").alias("point_count"),
         F.countDistinct("vehicle").alias("vehicles")
     )
-    
+
     congested_cells_count = agg_df.filter(F.col("congested_count") > 0).count()
     logger.info(
         "Batch %d | %d total points | %d congested grid cells",
@@ -531,16 +529,16 @@ def write_to_sinks(batch_df: DataFrame, batch_id: int) -> None:
     # Use foreachPartition to write/delete to Redis from worker nodes
     agg_df.foreachPartition(
         lambda partition: _write_partition_to_redis(
-            partition, 
-            batch_id, 
-            REDIS_HOST, 
-            REDIS_PORT, 
-            REDIS_TTL_SECONDS, 
+            partition,
+            batch_id,
+            REDIS_HOST,
+            REDIS_PORT,
+            REDIS_TTL_SECONDS,
             REDIS_MAX_SEVERITY_KEYS,
             CONGESTION_UPDATES_CHANNEL,
         )
     )
-    
+
     batch_df.unpersist()
 
 
@@ -574,11 +572,11 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # (Đã comment lại theo yêu cầu, hiện tại chỉ dùng door_up/door_down)
     # bus_stops = spark.read.option("header", "true").option("inferSchema", "true").csv(BUS_STOPS_PATH)
     # stops = bus_stops.collect()
-    # 
+    #
     # distance_conds = []
     # for row in stops:
     #     distance_conds.append(f"(sqrt(pow((y - {row.stop_y}) * {LAT_M}, 2) + pow((x - {row.stop_x}) * {LAT_M * COS_LAT}, 2)) < {DWELL_RADIUS_M})")
-    # 
+    #
     # distance_expr = " OR ".join(distance_conds) if distance_conds else "false"
 
     # 1b. Kafka source
@@ -618,7 +616,7 @@ def _build_ingestion_pipeline(spark: SparkSession) -> DataFrame:
     # 1d. Dwell-time filter: loại "dừng đón khách" gần trạm (dùng SQL Expr thay vì Join + GroupBy)
     # (Đã comment lại theo yêu cầu, hiện tại bỏ qua logic filter theo trạm)
     # clean_stream = parsed.withColumn(
-    #     "is_dwell", 
+    #     "is_dwell",
     #     F.expr(f"(speed < {DWELL_SPEED_KMH}) AND ({distance_expr})")
     # ).filter(~F.col("is_dwell")).drop("is_dwell")
 
